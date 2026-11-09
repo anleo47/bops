@@ -1,7 +1,7 @@
 import "server-only";
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { DISPLAYS } from "@/lib/types";
@@ -26,7 +26,32 @@ import { bopsHome, chromeRoot } from "./user-paths";
  * before another's bot uses its port.
  */
 
-export const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const onWindows = process.platform === "win32";
+/** Google Chrome on Windows: the machine-wide install, else this user's own. */
+const windowsChrome = () => {
+  const places = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter(Boolean) as string[];
+  const found = places.map((p) => join(p, "Google", "Chrome", "Application", "chrome.exe")).find((p) => existsSync(p));
+  return found ?? join(process.env.PROGRAMFILES ?? "C:\\Program Files", "Google", "Chrome", "Application", "chrome.exe");
+};
+export const CHROME = process.env.BOPS_CHROME_PATH || (onWindows ? windowsChrome() : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+
+/**
+ * Whether a process whose command line has `text` in it is running, and stopping every such process:
+ * pgrep and pkill on the Mac, PowerShell's process list on Windows.
+ */
+const WIN_MATCH = (text: string) => `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${text.replace(/'/g, "''")}') -and $_.ProcessId -ne $PID }`;
+const psRun = (script: string, done: (failed: boolean, out: string) => void) =>
+  execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 15_000 }, (e, out) => done(!!e, String(out ?? "")));
+function processRunning(text: string) {
+  if (onWindows) return new Promise<boolean>((r) => psRun(`if (${WIN_MATCH(text)}) { 'yes' }`, (_, out) => r(out.trim() === "yes")));
+  const pattern = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new Promise<boolean>((r) => execFile("pgrep", ["-f", "--", pattern], (e) => r(!e)));
+}
+function stopProcesses(text: string) {
+  if (onWindows) return new Promise((r) => psRun(`${WIN_MATCH(text)} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`, () => r(null)));
+  const pattern = text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new Promise((r) => execFile("pkill", ["-f", "--", pattern], () => r(null)));
+}
 /**
  * Where the signed-in user's Mac tasks keep their folders: ~/.bops/users/<id>/tasks, beside their
  * Chrome profiles' own folder (~/.bops/tasks on a self-hosted install running on its own key). Signed
@@ -54,6 +79,12 @@ export const taskSockets = (dir: string) => join(/*turbopackIgnore: true*/ bopsH
 export const taskWorkspace = (sessionId: string) => join(taskDir(sessionId), "workspace");
 const CHROME_VERSION = (() => {
   try {
+    // On Windows, Chrome keeps each version in a folder of that name beside chrome.exe.
+    if (onWindows) {
+      const v = readdirSync(dirname(CHROME)).filter((n) => /^\d+\.\d+\.\d+\.\d+$/.test(n));
+      if (v.length) return v.sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]))[0];
+      return "154.0.0.0";
+    }
     // Bounded: it runs as the server starts, and a stalled read would hold up everything after it.
     return execFileSync("defaults", ["read", "/Applications/Google Chrome.app/Contents/Info", "CFBundleShortVersionString"], { timeout: 2000 })
       .toString()
@@ -62,8 +93,10 @@ const CHROME_VERSION = (() => {
     return "154.0.0.0";
   }
 })();
-/** Headless Chrome announces itself as "HeadlessChrome"; present as the normal Mac browser. */
-const USER_AGENT = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION.split(".")[0]}.0.0.0 Safari/537.36`;
+/** Headless Chrome announces itself as "HeadlessChrome"; present as the normal browser for this computer. */
+const USER_AGENT = onWindows
+  ? `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION.split(".")[0]}.0.0.0 Safari/537.36`
+  : `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_VERSION.split(".")[0]}.0.0.0 Safari/537.36`;
 const real = (p: string) => (existsSync(p) ? realpathSync(p) : p);
 /** The browser tools' package folder, at its real path: in the app, the server's node_modules links into the app bundle. */
 const nodeModules = () => real(join(process.cwd(), "node_modules"));
@@ -108,10 +141,10 @@ export async function quitBotChromes({ switching = true } = {}) {
   if (switching) gq.bopsChromeQuits = quits() + 1;
   // The screens' mirrors keep the last page they saw: they go too.
   closeMirrors();
-  const pattern = `--user-data-dir=${chromeRoot()}/`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const running = () => new Promise<boolean>((r) => execFile("pgrep", ["-f", "--", pattern], (e) => r(!e)));
+  const text = `--user-data-dir=${chromeRoot()}${onWindows ? "\\" : "/"}`;
+  const running = () => processRunning(text);
   if (!(await running())) return;
-  await new Promise((r) => execFile("pkill", ["-f", "--", pattern], () => r(null)));
+  await stopProcesses(text);
   for (let i = 0; i < 20 && (await running()); i++) await new Promise((r) => setTimeout(r, 150));
 }
 

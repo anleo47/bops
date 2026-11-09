@@ -176,7 +176,7 @@ The app itself is Electron and Next.js.
 
 ### Requirements
 
-- A Mac with Apple silicon, and Node 22 or newer.
+- A Mac with Apple silicon, or a Windows 10 or 11 PC (see [On Windows](#on-windows)), and Node 22 or newer.
 - **Required:** an [Orgo](https://orgo.ai) account and an OpenAI API key, plus a second, restricted OpenAI key with a spend limit for tasks (`OPENAI_EXECUTOR_API_KEY`).
 - **Recommended:** TypeSafe (small judgment calls), Honcho (memory), Composio (apps), treg (business data), AgentMail (email), Tailscale (a direct live view of the bots' screens).
 - **Optional:** AgentPhone and a public URL, for texts and calls.
@@ -194,6 +194,31 @@ In `.env.local`, fill in at least `OPENAI_API_KEY` and `OPENAI_EXECUTOR_API_KEY`
 Or run the server alone with `npx next dev --port 3210 -H 127.0.0.1` and open http://127.0.0.1:3210. Leave out `-H 127.0.0.1` only when `edge/` or the bots' computers must reach it over your tailnet.
 
 The app opens on sign-in: **Continue with Google**, **Continue with email** or **Sign in with Orgo**. With `BOPS_SELF_HOSTED=1` and `ORGO_API_KEY` set, it skips this and uses your key. Then open **Settings → You** and add your name and a line about yourself: every bot uses it.
+
+### On Windows
+
+Bops runs on Windows 10 and 11 (x64) with Node 22 or newer and Git for Windows. In PowerShell or Command Prompt:
+
+```bash
+npm run setup:windows        # dependencies, Electron, .env.local from .env.example, and the git hook
+npm run app                  # opens the app, which starts the server on port 3210
+```
+
+The first start compiles the app and can take a minute or two; later starts are quicker. To install it as an app with a Start menu entry and a desktop shortcut:
+
+```bash
+npm run app:release:win      # builds the server in, then makes dist-desktop/Bops Setup <version>.exe
+```
+
+Run that installer once. It isn't code-signed, so Windows SmartScreen asks first: **More info**, then **Run anyway**. The installed app keeps its files in `%APPDATA%\Bops`, its logs in `%APPDATA%\Bops\logs`, and its own settings in `%APPDATA%\Bops\.env.local`. For a quicker build that runs `next dev` from this folder instead, use `npm run app:build:win`.
+
+What's different from the Mac:
+
+- **Saved logins and tokens** are sealed with Windows' own per-user encryption (DPAPI) in `%USERPROFILE%\.bops\vault`, where the Mac uses the Keychain. Only your Windows account on this PC can open them.
+- **Tasks on your own computer** (Chrome and Codex on your PC, and Full access) aren't available yet: they rely on the macOS sandbox. Your bots work on their own cloud computers as usual.
+- **Route through this PC** needs Orgo's relay agent, which has no Windows build here.
+- **Updates** don't install themselves: pull this repository and run `npm run app:release:win` again.
+- The window keeps the standard Windows title bar, and Bops keeps the PC awake while a task runs, as it does a Mac.
 
 ### Settings
 

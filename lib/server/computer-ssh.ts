@@ -26,8 +26,16 @@ import { userDir } from "./store";
  */
 
 /** Which ssh and ssh-keygen run (overridable only for scripts/test-hosted-apps.mjs: Bops never sets them). */
-const SSH_BIN = () => process.env.BOPS_SSH_BIN || "/usr/bin/ssh";
-const KEYGEN_BIN = () => process.env.BOPS_SSH_KEYGEN_BIN || "/usr/bin/ssh-keygen";
+const onWindows = process.platform === "win32";
+/** Windows' own OpenSSH client (System32OpenSSH, an optional feature that's on by default), else whichever is on the PATH. */
+const windowsSsh = (name: string) => {
+  const own = join(process.env.SystemRoot ?? "C:\Windows", "System32", "OpenSSH", `${name}.exe`);
+  return existsSync(/*turbopackIgnore: true*/ own) ? own : `${name}.exe`;
+};
+const SSH_BIN = () => process.env.BOPS_SSH_BIN || (onWindows ? windowsSsh("ssh") : "/usr/bin/ssh");
+const KEYGEN_BIN = () => process.env.BOPS_SSH_KEYGEN_BIN || (onWindows ? windowsSsh("ssh-keygen") : "/usr/bin/ssh-keygen");
+/** ssh's empty file: Windows' OpenSSH reads NUL. */
+const DEV_NULL = onWindows ? "NUL" : "/dev/null";
 
 /** How long ssh may take to connect and open its forward before it counts as not answering. */
 const UP_MS = 20_000;
@@ -82,7 +90,20 @@ export async function sshKey(): Promise<{ dir: string; key: string; pub: string 
   }
   // (ssh refuses a private key others can read.)
   chmodSync(/*turbopackIgnore: true*/ key, 0o600);
+  if (onWindows) await ownerOnly(key);
   return { dir, key, pub: `${pub} bops` };
+}
+
+/**
+ * On Windows a file's mode bits don't keep others out, and Windows' ssh refuses a key its ACL lets others read:
+ * the key's inherited permissions go, and only this user (and SYSTEM) keep any.
+ */
+function ownerOnly(file: string) {
+  const user = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\${process.env.USERNAME}` : process.env.USERNAME;
+  if (!user) return Promise.resolve();
+  return new Promise<void>((done) =>
+    execFile("icacls.exe", [file, "/inheritance:r", "/grant:r", `${user}:F`, "/grant:r", "*S-1-5-18:F"], { windowsHide: true, timeout: 15_000 }, () => done()),
+  );
 }
 
 /** A new key pair (ed25519, no passphrase) in place of whatever half of one was there: its public key's type and body. */
@@ -159,7 +180,7 @@ export async function sshPlace(computerId: string): Promise<SshPlace> {
  */
 export const sshArgs = (at: SshPlace, sock: string, port: number) => [
   "-F",
-  "/dev/null",
+  DEV_NULL,
   "-i",
   at.key,
   "-o",
@@ -173,7 +194,7 @@ export const sshArgs = (at: SshPlace, sock: string, port: number) => [
   "-o",
   `UserKnownHostsFile="${at.knownHosts}"`,
   "-o",
-  "GlobalKnownHostsFile=/dev/null",
+  `GlobalKnownHostsFile=${DEV_NULL}`,
   "-o",
   "HostKeyAlgorithms=ssh-ed25519",
   "-o",
@@ -198,6 +219,39 @@ export const sshArgs = (at: SshPlace, sock: string, port: number) => [
   "--",
   at.host,
 ];
+
+/**
+ * Windows' ssh can't forward to a Unix socket: there a tunnel's "socket" is a port of its own on 127.0.0.1
+ * ("127.0.0.1:<port>"), one that was free a moment before ssh takes it.
+ */
+const tcpAt = (sock: string) => (/^127.0.0.1:d+$/.test(sock) ? { host: "127.0.0.1", port: Number(sock.split(":")[1]) } : null);
+function freePort(): Promise<number> {
+  return new Promise((done, fail) => {
+    const srv = net.createServer();
+    srv.once("error", fail);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as net.AddressInfo).port;
+      srv.close(() => done(port));
+    });
+  });
+}
+const connectTo = (s: net.Socket, sock: string) => {
+  const tcp = tcpAt(sock);
+  return tcp ? s.connect(tcp.port, tcp.host) : s.connect({ path: sock });
+};
+/** Whether ssh's end of the tunnel is there: its socket file, or on Windows its port taking connections. */
+function sockUp(sock: string): Promise<boolean> {
+  const tcp = tcpAt(sock);
+  if (!tcp) return Promise.resolve(existsSync(/*turbopackIgnore: true*/ sock));
+  return new Promise((done) => {
+    const c = net.connect(tcp.port, tcp.host);
+    c.setTimeout(1000);
+    c.once("connect", () => (c.destroy(), done(true)));
+    c.once("error", () => done(false));
+    c.once("timeout", () => (c.destroy(), done(false)));
+  });
+}
+const removeSock = (sock: string) => tcpAt(sock) || rmSync(/*turbopackIgnore: true*/ sock, { force: true });
 
 /** A folder for this server's tunnel sockets, only this user's (a short path: a socket's is at most 104 bytes). */
 function sockDir() {
@@ -232,7 +286,8 @@ const running = (t: Tunnel) => t.up && !!t.child && t.child.exitCode === null &&
  */
 export async function sshTunnel(computerId: string, port: number): Promise<{ host: string; carrier: Carrier }> {
   g.bopsSshCount = (g.bopsSshCount ?? 0) + 1;
-  const t: Tunnel = { computerId, port, sock: join(/*turbopackIgnore: true*/ sockDir(), `${g.bopsSshCount}.sock`), host: "", up: false, closed: false, failures: 0 };
+  const sock = onWindows ? `127.0.0.1:${await freePort()}` : join(/*turbopackIgnore: true*/ sockDir(), `${g.bopsSshCount}.sock`);
+  const t: Tunnel = { computerId, port, sock, host: "", up: false, closed: false, failures: 0 };
   try {
     await bringUp(t);
   } catch (e) {
@@ -251,9 +306,10 @@ async function bringUp(t: Tunnel) {
 /** ssh started for the tunnel: done once its socket is there (it's connected, and its forward is open), refused when it stops before. */
 function start(t: Tunnel, at: SshPlace): Promise<void> {
   return new Promise((done, fail) => {
-    rmSync(/*turbopackIgnore: true*/ t.sock, { force: true });
-    // Only what ssh needs: none of this server's own keys go to it.
+    removeSock(t.sock);
+    // Only what ssh needs: none of this server's own keys go to it. (Windows' ssh also needs its system folders.)
     const env: Record<string, string> = { PATH: process.env.PATH ?? "/usr/bin:/bin" };
+    if (onWindows) for (const k of ["SystemRoot", "USERPROFILE", "USERNAME", "TEMP", "TMP"]) if (process.env[k]) env[k] = process.env[k]!;
     const child = spawn(/*turbopackIgnore: true*/ SSH_BIN(), sshArgs(at, t.sock, t.port), { stdio: ["ignore", "ignore", "pipe"], env: env as NodeJS.ProcessEnv });
     t.child = child;
     const began = Date.now();
@@ -261,14 +317,21 @@ function start(t: Tunnel, at: SshPlace): Promise<void> {
     child.stderr?.setEncoding("utf8").on("data", (d: string) => (said = (said + d).slice(-1000)));
     let up = 0;
     let over = false;
+    let looking = false;
     const look = setInterval(() => {
-      if (existsSync(/*turbopackIgnore: true*/ t.sock)) {
-        clearInterval(look);
-        up = Date.now();
-        t.up = true;
-        done();
-      } else if (Date.now() - began > UP_MS) child.kill("SIGKILL");
-    }, 100);
+      if (looking) return;
+      looking = true;
+      void sockUp(t.sock).then((there) => {
+        looking = false;
+        if (over || up) return;
+        if (there) {
+          clearInterval(look);
+          up = Date.now();
+          t.up = true;
+          done();
+        } else if (Date.now() - began > UP_MS) child.kill("SIGKILL");
+      });
+    }, onWindows ? 250 : 100);
     const gone = () => {
       if (over) return;
       over = true;
@@ -277,7 +340,7 @@ function start(t: Tunnel, at: SshPlace): Promise<void> {
         t.child = undefined;
         t.up = false;
       }
-      rmSync(/*turbopackIgnore: true*/ t.sock, { force: true });
+      removeSock(t.sock);
       if (!up) return fail(new SshError("no-answer", said.trim().slice(-200)));
       if (!t.closed) console.warn(`[ssh] the tunnel to ${t.computerId} port ${t.port} dropped: ${said.trim().slice(-200) || "ssh stopped"}`);
       lost(t, Date.now() - up);
@@ -294,8 +357,8 @@ function start(t: Tunnel, at: SshPlace): Promise<void> {
  */
 function through(t: Tunnel): net.Socket {
   const s = new net.Socket();
-  const go = () => (!t.closed && running(t) ? s.connect({ path: t.sock }) : s.destroy(new Error("Its computer's SSH is down")));
-  if (running(t)) return s.connect({ path: t.sock });
+  const go = () => (!t.closed && running(t) ? connectTo(s, t.sock) : s.destroy(new Error("Its computer's SSH is down")));
+  if (running(t)) return connectTo(s, t.sock);
   if (Date.now() - (t.triedAt ?? 0) > ASK_MS) again(t);
   if (t.trying) void t.trying.then(go);
   else process.nextTick(go);
@@ -341,5 +404,5 @@ function shut(t: Tunnel) {
     child.kill("SIGTERM");
     setTimeout(() => child.exitCode === null && child.signalCode === null && child.kill("SIGKILL"), 3000).unref();
   }
-  rmSync(/*turbopackIgnore: true*/ t.sock, { force: true });
+  removeSock(t.sock);
 }

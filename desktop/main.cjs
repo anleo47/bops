@@ -19,6 +19,8 @@ const { ownCall } = require("./own-call.cjs");
 
 const PORT = 3210;
 const URL = `http://localhost:${PORT}`;
+/** Bops on Windows: no login shell, lsof or Unix sockets, and processes are stopped with taskkill. */
+const onWindows = process.platform === "win32";
 /*
  * The server listens on 127.0.0.1 only. "localhost" can also mean ::1, where another account on this
  * Mac could listen and pass health on to the real server; so this app's own calls go to 127.0.0.1,
@@ -55,6 +57,8 @@ function windowToken() {
  * from an earlier start reaches it too). A path too long for a socket goes in this user's own temp folder.
  */
 function renderSocket() {
+  // Windows has named pipes where the Mac has a socket file: one named for this user's Bops folder.
+  if (onWindows) return `\\\\.\\pipe\\bops-render-${crypto.createHash("sha256").update(app.getPath("userData")).digest("hex").slice(0, 16)}`;
   const file = path.join(app.getPath("userData"), "render.sock");
   return Buffer.byteLength(file) < 100 ? file : path.join(os.tmpdir(), "bops-render.sock");
 }
@@ -109,6 +113,8 @@ let shellPath;
 /** The login shell still being asked, so quitting can stop it. */
 let pathProbe;
 function loginPath() {
+  // Windows apps get the user's whole PATH from Explorer: nothing to borrow.
+  if (onWindows) return Promise.resolve(process.env.PATH ?? "");
   shellPath ??= new Promise((resolve) => {
     const fallback = [...new Set([...(process.env.PATH ?? "").split(":").filter(Boolean), ...FALLBACK_PATH])].join(":");
     let out = "";
@@ -225,6 +231,7 @@ async function whoAnswers() {
  * its id, name, user, parent and folder. Null when there's none, or it can't be seen (another user's).
  */
 async function listener() {
+  if (onWindows) return windowsListener();
   const out = (await output("lsof", ["-b", "-w", "-nP", `-iTCP:${PORT}`, "-sTCP:LISTEN", "-Fpc"])) ?? "";
   // One entry per process ("p<pid>" then "c<name>"); a port can have more than one (127.0.0.1 and ::1).
   const found = [...out.matchAll(/^p(\d+)\n(?:c(.*))?/gm)].map((m) => ({ pid: Number(m[1]), name: m[2] || "a program" })).filter((l) => l.pid > 1);
@@ -237,11 +244,77 @@ async function listener() {
   return all.find((l) => stoppable(l)) ?? all[0] ?? null;
 }
 
+/**
+ * The same on Windows, from PowerShell: who listens on the port, its parent, its program and its command
+ * line (in `comm`, which is what tells a Bops server: see looksLikeBops). Its folder can't be read there.
+ */
+const LISTENER_PS = `$ErrorActionPreference = 'SilentlyContinue'; @(Get-NetTCPConnection -LocalPort ${PORT} -State Listen | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { $w = Get-CimInstance Win32_Process -Filter "ProcessId=$_"; if ($w) { [pscustomobject]@{ pid = [int]$_; name = $w.Name; ppid = [int]$w.ParentProcessId; exe = $w.ExecutablePath; cmd = $w.CommandLine } } }) | ConvertTo-Json -Compress`;
+async function windowsListener() {
+  const out = (await output("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", LISTENER_PS], 8000)) ?? "";
+  let found = [];
+  try {
+    const parsed = JSON.parse(out.trim() || "[]");
+    found = (Array.isArray(parsed) ? parsed : [parsed]).filter((l) => l && l.pid > 4);
+  } catch {}
+  const all = found.slice(0, 3).map((l) => ({ pid: l.pid, name: l.name || "a program", ppid: l.ppid, comm: l.cmd ?? "", exe: l.exe ?? "", uid: undefined, home: undefined }));
+  return all.find((l) => stoppable(l)) ?? all[0] ?? null;
+}
+
+/** Whether a process is still running (one this user can't see counts). */
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+};
+
+/**
+ * Sends `sig` to a process and the ones it started: its process group on the Mac. Windows has neither
+ * signals nor groups, so there the whole tree is ended at once (taskkill /T /F). Says whether it reached it.
+ */
+function signalTree(pid, sig) {
+  if (onWindows) {
+    try {
+      execFileSync("taskkill.exe", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 10_000 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    process.kill(-pid, sig);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, sig);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** The bots' background Chromes (their profiles under ~/.bops/chrome), closed when Bops quits. */
+function quitBotChromes() {
+  try {
+    if (onWindows)
+      execFileSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { $_.CommandLine -like '*\\.bops\\chrome\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+        { stdio: "ignore", windowsHide: true, timeout: 10_000 },
+      );
+    else execFileSync("pkill", ["-f", ".bops/chrome/"]);
+  } catch {}
+}
+
 /** "Docker (pid 812)", for the trouble page and the log. */
 const named = (l) => (l ? `${l.name} (pid ${l.pid})` : null);
 
 /** A Bops server by its process: Next renames its process ("next-server (v16…)"), and before that it's the Helper. */
-const looksLikeBops = (l) => !!l && (l.comm.startsWith("next-server") || l.comm.includes("Bops Helper"));
+// (On Windows `comm` is the command line, and the packaged server's names BOPS_SERVER_JS: see SERVER_BOOT.)
+const looksLikeBops = (l) => !!l && (l.comm.startsWith("next-server") || l.comm.includes("Bops Helper") || (onWindows && l.comm.includes("BOPS_SERVER_JS")));
 
 /*
  * A server Bops may stop: a Bops server of this user's, running in this Mac's Application Support,
@@ -250,7 +323,10 @@ const looksLikeBops = (l) => !!l && (l.comm.startsWith("next-server") || l.comm.
  * copy from opening, but an old copy from before it can still be open).
  */
 const stoppable = (l) =>
-  looksLikeBops(l) && l.uid === process.getuid() && !!l.home && realpath(l.home) === realpath(serverHome()) && (l.ppid === 1 || l.ppid === process.pid);
+  onWindows
+    ? // Windows shows neither its user nor its folder: run by this very app's program, and started by it or left behind (its parent gone).
+      looksLikeBops(l) && !!l.exe && realpath(l.exe).toLowerCase() === realpath(nodeBinary()).toLowerCase() && (l.ppid === process.pid || !alive(l.ppid))
+    : looksLikeBops(l) && l.uid === process.getuid() && !!l.home && realpath(l.home) === realpath(serverHome()) && (l.ppid === 1 || l.ppid === process.pid);
 
 /**
  * Stops a server by its process group (its bots' tools with it): SIGINT first, which lets one in the
@@ -259,24 +335,8 @@ const stoppable = (l) =>
  * Resolves whether the port is free.
  */
 async function stopProcess(pid) {
-  const running = () => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (e) {
-      return e?.code === "EPERM";
-    }
-  };
-  const holding = async () => running() || (await portTaken());
-  const kill = (sig) => {
-    try {
-      process.kill(-pid, sig);
-    } catch {
-      try {
-        process.kill(pid, sig);
-      } catch {}
-    }
-  };
+  const holding = async () => alive(pid) || (await portTaken());
+  const kill = (sig) => void signalTree(pid, sig);
   kill("SIGINT");
   for (let i = 0; i < 28 && (await holding()); i++) await sleep(250);
   if (await holding()) {
@@ -307,6 +367,10 @@ function packagedServer() {
     if (name === ".data" || name.startsWith(".env")) continue;
     const link = path.join(home, name);
     const st = fs.lstatSync(link, { throwIfNoEntry: false });
+    if (onWindows) {
+      linkOnWindows(path.join(dir, name), link, st);
+      continue;
+    }
     if (st && !st.isSymbolicLink()) continue;
     if (st && fs.readlinkSync(link) === path.join(dir, name)) continue;
     if (st) fs.unlinkSync(link);
@@ -335,6 +399,29 @@ function packagedServer() {
   return { dir, home, log, env: { ...shipped, ...env, ...(fs.existsSync(relay) ? { BOPS_RELAY_BIN: relay } : {}), ...(fs.existsSync(ingot) ? { BOPS_INGOT_DIR: ingot } : {}) } };
 }
 
+/**
+ * Windows lets anyone make a folder junction, but a file link only with Developer Mode or as admin: there
+ * folders are junctions to the bundle, and files are copies, made again whenever the bundle's differs (a
+ * new version). `st` is what's at `link` now.
+ */
+function linkOnWindows(target, link, st) {
+  if (fs.statSync(target).isDirectory()) {
+    if (st?.isSymbolicLink() && realpath(link).toLowerCase() === realpath(target).toLowerCase()) return;
+    // A junction is removed on its own (never what it points to); a real folder there goes whole.
+    if (st?.isSymbolicLink()) fs.rmdirSync(link);
+    else if (st) fs.rmSync(link, { recursive: true, force: true });
+    fs.symlinkSync(target, link, "junction");
+    return;
+  }
+  if (st?.isFile()) {
+    const a = fs.statSync(target);
+    // (Windows' copy keeps the file's time: the same size and time is the same file.)
+    if (a.size === st.size && a.mtimeMs === st.mtimeMs) return;
+  }
+  if (st) fs.rmSync(link, { force: true });
+  fs.copyFileSync(target, link);
+}
+
 /** The Helper app's binary (Frameworks/<App> Helper.app), which runs in the background with no Dock icon; else the app's own. */
 /** What the Helper runs as Node: the packaged server, with no request time limit (see its spawn below). */
 const SERVER_BOOT =
@@ -354,6 +441,17 @@ let leaving = false;
 let adopted;
 /** Our server being stopped because it never answered: killed outright if Bops quits meanwhile (it has nothing to save). */
 let lettingGo;
+
+/** The development server's output on Windows (dev-server.log in the logs folder), started over past 5 MB. */
+let devLog;
+function devServerLog() {
+  fs.mkdirSync(app.getPath("logs"), { recursive: true });
+  const file = path.join(app.getPath("logs"), "dev-server.log");
+  const big = (fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0) > 5 * 1024 * 1024;
+  const fd = fs.openSync(file, big ? "w" : "a");
+  fs.writeSync(fd, `\n--- next dev starting, ${new Date().toISOString()}\n`);
+  return fd;
+}
 
 async function spawnServer() {
   const packaged = packagedServer();
@@ -377,7 +475,9 @@ async function spawnServer() {
           ...packaged.env,
           PATH,
           ELECTRON_RUN_AS_NODE: "1",
-          BOPS_SERVER_JS: path.join(packaged.dir, "server.js"),
+          // On Windows, the copy of server.js in the working folder (packagedServer): Next finds its files
+          // relative to that folder, and from the app's own folder, on another drive, there's no relative path.
+          BOPS_SERVER_JS: path.join(onWindows ? packaged.home : packaged.dir, "server.js"),
           NODE_ENV: "production",
           // The server exits on SIGTERM itself, after its last work (the state saved to Bops Cloud, or self-hosted to its file).
           NEXT_MANUAL_SIG_HANDLE: "true",
@@ -390,15 +490,27 @@ async function spawnServer() {
           HOSTNAME: packaged.env.BOPS_LISTEN_ALL === "1" ? "0.0.0.0" : "127.0.0.1",
         },
         stdio: ["ignore", packaged.log, packaged.log],
-        detached: true,
+        // (On Windows a detached child gets a console window of its own: there it stays attached, hidden.)
+        detached: !onWindows,
+        windowsHide: true,
       })
-    : spawn("npx", ["next", "dev", "--port", String(PORT)], {
-        cwd: REPO,
-        env: { ...process.env, PATH, BOPS_UI_TOKEN: windowToken(), BOPS_RENDER_SOCKET: renderSocket() },
-        stdio: "ignore",
-        detached: true,
-      });
+    : onWindows
+      ? // npx is a .cmd script on Windows, which only cmd.exe runs. What it prints goes to dev-server.log in the logs folder.
+        spawn("cmd.exe", ["/d", "/s", "/c", `npx next dev --port ${PORT}`], {
+          cwd: REPO,
+          env: { ...process.env, PATH, BOPS_UI_TOKEN: windowToken(), BOPS_RENDER_SOCKET: renderSocket() },
+          stdio: ["ignore", (devLog = devServerLog()), devLog],
+          windowsHide: true,
+        })
+      : spawn("npx", ["next", "dev", "--port", String(PORT)], {
+          cwd: REPO,
+          env: { ...process.env, PATH, BOPS_UI_TOKEN: windowToken(), BOPS_RENDER_SOCKET: renderSocket() },
+          stdio: "ignore",
+          detached: true,
+        });
   if (packaged) fs.closeSync(packaged.log);
+  if (devLog !== undefined) fs.closeSync(devLog);
+  devLog = undefined;
   server = child;
   // A server that can't start, or stops later, is noticed now, not after a long wait on its port.
   child.once("error", (e) => {
@@ -454,7 +566,11 @@ function watchAdopted(pid, ours = false) {
  * - the port taken by a Bops server that doesn't answer (starting, on its way out, or stuck): wait, then stop it if it may be stopped;
  * - the port free: start ours (again, if it stopped).
  */
-const START_MS = 60_000;
+// `next dev` on Windows compiles its first pages slowly (over a minute on a cold cache, Defender scanning
+// every file it writes): a development server there gets 5 minutes to answer, and its page as long to load.
+// A release server starts in seconds.
+const slowDev = () => onWindows && !isRelease();
+const START_MS = slowDev() ? 300_000 : 60_000;
 const SILENT_MS = 15_000;
 /** One start at a time, whichever window asks. */
 let ensuring;
@@ -507,7 +623,7 @@ async function startOrFind() {
       }
       if (!stopped && l && Date.now() - silentSince > SILENT_MS) {
         if (!stoppable(l)) {
-          const why = l.uid !== process.getuid() ? "another user's" : realpath(l.home ?? "") !== realpath(serverHome()) ? `it runs in ${l.home ?? "a folder Bops can't see"}` : `its parent is pid ${l.ppid}`;
+          const why = onWindows ? `it runs from ${l.exe || "a program Bops can't see"}` : l.uid !== process.getuid() ? "another user's" : realpath(l.home ?? "") !== realpath(serverHome()) ? `it runs in ${l.home ?? "a folder Bops can't see"}` : `its parent is pid ${l.ppid}`;
           mainLog(`${named(l)} hasn't answered in ${SILENT_MS / 1000}s and isn't ours to stop (${why})`);
           return { ok: false, reason: "other-bops", detail: named(l) };
         }
@@ -578,7 +694,7 @@ function openApp(win) {
             return true;
           },
         ),
-        sleep(30_000).then(() => false),
+        sleep(slowDev() ? 300_000 : 30_000).then(() => false),
       ]);
       // A page that crashed reports its load failed a few ms before the crash itself: wait for that
       // report, so the incident is told as a crash, and once.
@@ -595,7 +711,7 @@ function openApp(win) {
         });
       }
       if (!loaded && !win.isDestroyed()) {
-        mainLog("the app's page took over 30s to load");
+        mainLog(`the app's page took over ${slowDev() ? 300 : 30}s to load`);
         goneWhileOpening = null;
         win.webContents.stop();
         showTrouble(win, { reason: "server-slow" });
@@ -695,8 +811,9 @@ async function createWindow() {
     minWidth: 1180,
     minHeight: 640,
     title: "Bops",
-    titleBarStyle: "hiddenInset",
-    trafficLightPosition: { x: 14, y: 14 },
+    // The Mac's title bar is Bops' own, with the traffic lights inset. Windows keeps its own frame (its
+    // buttons would sit over the bar's right side), without the menu bar.
+    ...(onWindows ? { autoHideMenuBar: true } : { titleBarStyle: "hiddenInset", trafficLightPosition: { x: 14, y: 14 } }),
     backgroundColor: "#FFFFFF",
     icon: ICON,
     // Web pages open as tabs inside Bops (see components/app/panel-tabs.tsx). The preload lets the
@@ -704,6 +821,8 @@ async function createWindow() {
     webPreferences: { webviewTag: true, preload: path.join(__dirname, "preload.cjs") },
   });
   mainWin = win;
+  // Windows signing out or shutting down: that quit isn't held (see before-quit).
+  if (onWindows) win.on("session-end", () => (systemQuit = true));
   win.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
     return { action: "deny" };
@@ -882,7 +1001,7 @@ ipcMain.handle("mac-screens", async () => {
   const list = await desktopCapturer.getSources({ types: ["screen", "window"], thumbnailSize: { width: 0, height: 0 } });
   return { access, displays, bopsOn, sources: list.map((s) => ({ id: s.id, name: s.name, displayId: s.display_id || undefined })) };
 });
-ipcMain.handle("mac-screen-settings", () => shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"));
+ipcMain.handle("mac-screen-settings", () => (onWindows ? undefined : shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")));
 
 /*
  * What Bops asks macOS for, all in one place (components/app/setup.tsx, and Settings → This Mac):
@@ -1091,7 +1210,12 @@ ipcMain.handle("perm-request", async (_, id) => {
   }
   return permStatus(id);
 });
-ipcMain.handle("perm-settings", (_, id) => (PANES[id] ? shell.openExternal(PANES[id]) : undefined));
+// Windows' own Settings pages for the two it has (it asks for no screen recording, disk or automation access).
+const WINDOWS_PANES = { microphone: "ms-settings:privacy-microphone", notifications: "ms-settings:notifications" };
+ipcMain.handle("perm-settings", (_, id) => {
+  const panes = onWindows ? WINDOWS_PANES : PANES;
+  return Object.hasOwn(panes, id) ? shell.openExternal(panes[id]) : undefined;
+});
 // Screen Recording was turned on after Bops started: it works once Bops restarts.
 ipcMain.handle("perm-screen-restart", () => mac && screenAtLaunch !== "granted" && systemPreferences.getMediaAccessStatus("screen") === "granted");
 
@@ -1131,13 +1255,7 @@ async function stopForRestart(why = "Restart Bops") {
     const l = await listener();
     if (stoppable(l)) {
       mainLog(`restart: the server (pid ${l.pid}) still holds the port: SIGKILL`);
-      try {
-        process.kill(-l.pid, "SIGKILL");
-      } catch {
-        try {
-          process.kill(l.pid, "SIGKILL");
-        } catch {}
-      }
+      signalTree(l.pid, "SIGKILL");
       for (let i = 0; i < 20 && (await portTaken()); i++) await sleep(250);
     }
   }
@@ -1181,18 +1299,8 @@ async function stopOtherServer(pid) {
   if (!isRelease()) return false;
   const l = await listener();
   if (!stoppable(l) || (pid && l.pid !== pid)) return false;
-  try {
-    process.kill(-l.pid, "SIGTERM");
-  } catch {
-    try {
-      process.kill(l.pid, "SIGTERM");
-    } catch {
-      return false;
-    }
-  }
-  try {
-    execFileSync("pkill", ["-f", ".bops/chrome/"]);
-  } catch {}
+  if (!signalTree(l.pid, "SIGTERM")) return false;
+  quitBotChromes();
   return true;
 }
 
@@ -1347,6 +1455,8 @@ ipcMain.handle("update-auto", () => (updates ? { auto: updates.auto(), canSelfUp
 ipcMain.handle("update-set-auto", (_, on) => updates?.setAuto(!!on) ?? null);
 
 app.setName("Bops");
+// Windows ties notifications and the taskbar to this id (the installer's Start menu shortcut carries it too).
+if (onWindows) app.setAppUserModelId("ai.orgo.bops");
 /*
  * One Bops at a time. Every copy shares the same Application Support folder and server, so a second
  * one (another copy opened from a download, say) brings the first to the front and closes, instead
@@ -1364,7 +1474,8 @@ app.whenReady().then(() => {
   mainLog(`Bops ${app.getVersion()} opening (pid ${process.pid})`);
   if (process.platform === "darwin" && fs.existsSync(ICON)) app.dock.setIcon(nativeImage.createFromPath(ICON));
   // Release builds only: not `npm run app`, nor a build that runs the source folder (desktop/repo.json).
-  if (isRelease()) {
+  // Updates come from bops.bot's signed Mac builds, so a Windows build doesn't look for them.
+  if (isRelease() && !onWindows) {
     updates = createUpdates({ autoUpdater, app, fs, path, note: updateNote, send: sendUpdate });
     // macOS logging out or shutting down quits Bops itself: that quit isn't held (see before-quit).
     powerMonitor.on("shutdown", () => (systemQuit = true));
@@ -1398,11 +1509,18 @@ app.on("window-all-closed", () => app.quit());
  */
 let quitStopped = false;
 let systemQuit = false;
+/*
+ * Windows has no SIGTERM to give the server its last save on the way out (a process there is only ever
+ * ended), so every quit there is the clean stop a restart makes: the server saves (POST /api/restart),
+ * then it's stopped. The same 10s at most.
+ */
 app.on("before-quit", (e) => {
-  if (quitStopped || restarting || systemQuit || !updates?.ready()) return;
+  if (quitStopped || restarting || systemQuit) return;
+  const installing = !!updates?.ready();
+  if (!installing && !(onWindows && (server || adopted))) return;
   quitStopped = true;
   e.preventDefault();
-  void Promise.race([stopForRestart(`Quit: installing Bops ${updates.state().version}`), sleep(10_000)]).finally(() => app.quit());
+  void Promise.race([stopForRestart(installing ? `Quit: installing Bops ${updates.state().version}` : "Quit"), sleep(10_000)]).finally(() => app.quit());
 });
 
 /** Stops the server Bops started or uses (and the bots' browsers). Says whether there was one. */
@@ -1411,33 +1529,19 @@ function stopServer() {
   if (!pid) return false;
   server = undefined;
   watchAdopted(undefined);
-  try {
-    process.kill(-pid, "SIGTERM");
-  } catch {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {}
-  }
-  try {
-    execFileSync("pkill", ["-f", ".bops/chrome/"]);
-  } catch {}
+  signalTree(pid, "SIGTERM");
+  quitBotChromes();
   return true;
 }
 
 app.on("will-quit", () => {
   leaving = true;
   renderService?.close();
-  if (lettingGo)
-    try {
-      process.kill(-lettingGo, "SIGKILL");
-    } catch {
-      try {
-        process.kill(lettingGo, "SIGKILL");
-      } catch {}
-    }
+  if (lettingGo) signalTree(lettingGo, "SIGKILL");
   const pid = server?.pid ?? adopted;
   // A server too stuck to act on SIGTERM would outlive Bops: stopped hard once its exit work's 8s are up.
-  if (stopServer() && pid)
+  // (On Windows stopServer already ended it, and everything it started.)
+  if (stopServer() && pid && !onWindows)
     try {
       spawn("/bin/sh", ["-c", `sleep 10; kill -KILL -${pid} 2>/dev/null || kill -KILL ${pid} 2>/dev/null`], { detached: true, stdio: "ignore" }).unref();
     } catch {}

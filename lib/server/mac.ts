@@ -43,7 +43,9 @@ export async function checkMac() {
   let next: MacState["next"];
   if (!onTheMac()) {
     next = "elsewhere";
-    reason = "Bots work on your Mac in the Bops app on your Mac.";
+    // Tasks on the user's own computer need the macOS sandbox (executor-sandbox.ts) and Codex's Mac build:
+    // on Windows the bots work on their own cloud computers only.
+    reason = process.platform === "win32" && !onPostgres() ? "Tasks on this PC aren't available on Windows yet. Your bots still work on their own computers." : "Bots work on your Mac in the Bops app on your Mac.";
   } else if (!findCodex()) {
     if (!installStatus()) installCodex(() => void checkMac().catch(() => {}));
     const failed = installStatus()?.state === "failed" ? installStatus()?.error : undefined;

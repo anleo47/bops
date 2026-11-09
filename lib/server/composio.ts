@@ -262,7 +262,11 @@ export async function connectApp(app: string, label?: string, replaces?: string,
     s.connecting = (s.connecting ?? []).filter((c) => !(c.app === app && c.status === "failed"));
     s.connecting.push({ id: waitId, app, appName, label: label?.trim() || undefined, status: "waiting", at: Date.now(), replaces, grant });
   });
-  if (req.redirectUrl) execFile("open", [req.redirectUrl]);
+  // The default browser: `open` on the Mac; on Windows the URL protocol handler (no shell, so nothing in the URL runs).
+  if (req.redirectUrl && /^https?:\/\//i.test(req.redirectUrl)) {
+    if (process.platform === "win32") execFile("rundll32.exe", ["url.dll,FileProtocolHandler", req.redirectUrl], { windowsHide: true });
+    else execFile("open", [req.redirectUrl]);
+  }
   void req
     .waitForConnection(15 * 60_000)
     .then(async (ca: { id: string }) => {
@@ -878,7 +882,10 @@ export const reachableFromComputers = () => !["127.0.0.1", "localhost", "::1"].i
 /** Where a bot computer reaches Bops: this Mac on the tailnet. */
 export function bopsAddress() {
   if (!reachableFromComputers()) return null;
-  const cli = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "tailscale"];
+  const cli =
+    process.platform === "win32"
+      ? [`${process.env.PROGRAMFILES ?? "C:\\Program Files"}\\Tailscale\\tailscale.exe`, "tailscale"]
+      : ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "tailscale"];
   for (const c of cli) {
     try {
       const ip = execFileSync(/*turbopackIgnore: true*/ c, ["ip", "-4"], { timeout: 4000 }).toString().trim().split("\n")[0];
